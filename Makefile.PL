@@ -10,7 +10,7 @@ WriteMakefile(
   LICENSE      => 'perl',
   MIN_PERL_VERSION => '5.036000',
   PREREQ_PM => {
-    'Linux::Event' => 0.007,
+    'Linux::Event' => 0.008,
   },
   TEST_REQUIRES => {
     'Test::More' => 0,
