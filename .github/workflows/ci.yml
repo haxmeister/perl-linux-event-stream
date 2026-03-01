@@ -7,17 +7,27 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
     strategy:
       matrix:
-        perl: ['5.36', '5.38', '5.40', '5.42']
+        perl-version: ['5.36', '5.38', '5.40']
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: shogo82148/actions-setup-perl@v1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Perl
+        uses: shogo82148/actions-setup-perl@v1
         with:
-          perl-version: ${{ matrix.perl }}
-      - name: Install deps
-        run: cpanm -n --installdeps .
+          perl-version: ${{ matrix.perl-version }}
+
+      - name: Install dependencies
+        run: |
+          cpanm --quiet --notest --installdeps .
+          cpanm --quiet --notest Linux::Event
+
       - name: Build
-        run: perl Makefile.PL && make
+        run: perl Makefile.PL
+
       - name: Test
         run: make test

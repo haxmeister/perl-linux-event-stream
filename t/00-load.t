@@ -1,7 +1,4 @@
 use strict;
 use warnings;
-use Test2::V0;
-
-use_ok('Linux::Event::Stream');
-
-done_testing;
+use Test::More tests => 1;
+ok(eval { require Linux::Event::Stream; 1 }, 'require Linux::Event::Stream') or diag $@;

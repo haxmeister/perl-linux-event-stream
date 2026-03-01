@@ -1,9 +1,7 @@
 Revision history for Linux-Event-Stream
 
-0.001  2026-02-22
-  - Initial release.
-  - Buffered write path with partial write handling and automatic write arming/disarming.
-  - High/low watermark backpressure state (is_write_blocked) and buffered_bytes.
-  - Raw on_read callback with pause_read/resume_read.
-  - close_after_drain for graceful shutdown.
-  - Idempotent close and on_close lifecycle callback.
+0.001  2026-03-01
+  - Initial release of Linux::Event::Stream (buffered, backpressure-aware I/O).
+  - Fix: persist write offset across partial syswrite() progress so buffered_bytes()
+    and watermark backpressure state update correctly when writes are EAGAIN-limited.
+  - Tests: add deterministic watermark test that polls unblock state via timer.

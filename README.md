@@ -1,63 +1,54 @@
 # Linux::Event::Stream
 
-Buffered, backpressure-aware I/O semantics for any nonblocking file descriptor used with **Linux::Event**.
+[![CI](https://github.com/haxmeister/perl-linux-event-stream/actions/workflows/ci.yml/badge.svg)](https://github.com/haxmeister/perl-linux-event-stream/actions/workflows/ci.yml)
 
-## What it is
+Buffered, backpressure-aware I/O for Linux::Event.
 
-`Linux::Event::Stream` is a small, focused abstraction:
+## Overview
 
-- **Buffered writes** with partial-write handling
-- Automatic **write readiness arming/disarming** (prevents write spin)
-- **High/low watermarks** for backpressure
-- `close_after_drain` for graceful shutdown
-- Raw-byte `on_read` callback with `pause_read` / `resume_read`
-- Idempotent teardown and lifecycle callbacks (`on_error`, `on_close`)
+Linux::Event::Stream wraps a nonblocking file descriptor and provides:
 
-## What it is *not*
+- Write buffering
+- High/low watermark backpressure (hysteresis latch)
+- Graceful close-after-drain
+- Optional read throttling
 
-Stream does **not** do:
+It does **not** create sockets, implement protocols, or modify the event loop.
+It is a small policy layer over a file descriptor.
 
-- socket setup (listen/connect/accept)
-- fork logic
-- TLS
-- protocol logic (HTTP, Redis, etc.)
-- loop modification
+Designed for use with **Linux::Event 0.007+**.
 
-## Install
+---
 
-```bash
-cpanm Linux::Event::Stream
-```
-
-## Quick example
+## Basic Example
 
 ```perl
 use v5.36;
 use Linux::Event;
 use Linux::Event::Stream;
-use Socket qw(AF_UNIX SOCK_STREAM PF_UNSPEC);
 
 my $loop = Linux::Event->new;
 
-socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, PF_UNSPEC) or die "socketpair: $!";
-
-my $s = Linux::Event::Stream->new(
+my $stream = Linux::Event::Stream->new(
   loop => $loop,
-  fh   => $a,
-  on_read => sub ($s, $bytes, $data) {
-    print "got: $bytes\n";
+  fh   => $socket,
+
+  on_read => sub ($stream, $bytes) {
+    print "Received: $bytes";
   },
+
+  on_error => sub ($stream, $errno) {
+    warn "I/O error: $errno";
+  },
+
+  on_close => sub ($stream) {
+    print "Connection closed\n";
+  },
+
+  high_watermark => 1_048_576,
+  low_watermark  =>   262_144,
 );
 
-$s->write("hello\n");
+$stream->write("hello\n");
+
 $loop->run;
-```
-
-## Status
-
-- v0.001: raw buffering + backpressure + lifecycle
-- v0.002 (planned): framing helpers (`on_line`, length frames, optional JSONL)
-
-## License
-
-Same terms as Perl itself.

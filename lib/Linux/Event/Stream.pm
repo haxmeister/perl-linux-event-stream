@@ -8,43 +8,36 @@ our $VERSION = '0.001';
 use Carp qw(croak);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 
-# Watcher callback shims (avoid per-instance closures; the Stream instance is passed as watcher data).
-sub _watch_read_cb  ($w, $fh, $stream) { _on_read_ready($stream, $w, $fh)  }
-sub _watch_write_cb ($w, $fh, $stream) { _on_write_ready($stream, $w, $fh) }
-sub _watch_error_cb ($w, $fh, $stream) { _on_error_ready($stream, $w, $fh) }
+# Watcher callbacks: ($loop, $fh, $watcher)
+# The Stream instance is stored in $watcher->data.
+sub _watch_read_cb  ($loop, $fh, $watcher) { my $self = $watcher->data or return; _on_read_ready($self, $watcher, $fh) }
+sub _watch_write_cb ($loop, $fh, $watcher) { my $self = $watcher->data or return; _on_write_ready($self, $watcher, $fh) }
+sub _watch_error_cb ($loop, $fh, $watcher) { my $self = $watcher->data or return; _on_error_ready($self, $watcher, $fh) }
 
 sub new ($class, %opt) {
-  my $loop = delete $opt{loop} // croak 'new(): missing required option: loop';
-  my $fh   = delete $opt{fh}   // croak 'new(): missing required option: fh';
+  my $loop = delete $opt{loop} // croak 'new(): missing loop';
+  my $fh   = delete $opt{fh}   // croak 'new(): missing fh';
 
   my $on_read  = delete $opt{on_read};
   my $on_error = delete $opt{on_error};
   my $on_close = delete $opt{on_close};
 
-  croak 'new(): on_read must be a coderef'  if defined $on_read  && ref($on_read)  ne 'CODE';
-  croak 'new(): on_error must be a coderef' if defined $on_error && ref($on_error) ne 'CODE';
-  croak 'new(): on_close must be a coderef' if defined $on_close && ref($on_close) ne 'CODE';
+  croak 'on_read must be a coderef'  if defined $on_read  && ref($on_read)  ne 'CODE';
+  croak 'on_error must be a coderef' if defined $on_error && ref($on_error) ne 'CODE';
+  croak 'on_close must be a coderef' if defined $on_close && ref($on_close) ne 'CODE';
 
   my $data = delete $opt{data};
 
-  my $high = delete $opt{high_watermark};
-  my $low  = delete $opt{low_watermark};
-
-  $high = 1_048_576 if !defined $high;
-  $low  =   262_144 if !defined $low;
-
+  my $high = delete $opt{high_watermark} // 1_048_576;
+  my $low  = delete $opt{low_watermark}  //   262_144;
   $low = $high if $low > $high;
 
-  my $read_size = delete $opt{read_size};
-  $read_size = 8192 if !defined $read_size;
+  my $read_size = delete $opt{read_size} // 8192;
+  my $max_read_per_tick = delete $opt{max_read_per_tick} // 0;
 
-  my $max_read_per_tick = delete $opt{max_read_per_tick};
-  $max_read_per_tick = 0 if !defined $max_read_per_tick;
+  my $close_fh = delete $opt{close_fh} // 0;
 
-  my $close_fh = delete $opt{close_fh};
-  $close_fh = 0 if !defined $close_fh;
-
-  croak 'new(): unknown options: ' . join(', ', sort keys %opt) if %opt;
+  croak 'unknown options: ' . join(', ', sort keys %opt) if %opt;
 
   _set_nonblocking($fh);
 
@@ -52,7 +45,6 @@ sub new ($class, %opt) {
     loop => $loop,
     fh   => $fh,
 
-    # callbacks + opaque user data
     on_read  => $on_read,
     on_error => $on_error,
     on_close => $on_close,
@@ -65,19 +57,18 @@ sub new ($class, %opt) {
     high_watermark => $high,
     low_watermark  => $low,
 
-    read_size        => $read_size,
-    max_read_per_tick=> $max_read_per_tick,
+    read_size         => $read_size,
+    max_read_per_tick => $max_read_per_tick,
 
-    # state flags
+    # state
     closed        => 0,
     closing       => 0,
     read_paused   => 0,
     write_blocked => 0,
-
     close_fh      => $close_fh,
-
-    # callback-once guard
     close_cb_fired => 0,
+
+    watcher => undef,
   }, $class;
 
   my $w = $loop->watch($fh,
@@ -85,28 +76,24 @@ sub new ($class, %opt) {
     write => \&_watch_write_cb,
     error => \&_watch_error_cb,
     data  => $self,
-
-    # Stream controls readiness itself; defaults here are fine.
-    edge_triggered => 0,
-    oneshot        => 0,
   );
 
   $self->{watcher} = $w;
 
-  # Don't arm write notifications unless we have buffered data.
-  _disable_write($self);
+  # Do not arm write notifications until there is buffered data.
+  $w->disable_write;
 
   return $self;
 }
 
 sub fh ($self) { $self->{fh} }
 
-sub is_closed ($self)  { !!$self->{closed} }
+sub is_closed  ($self) { !!$self->{closed} }
 sub is_closing ($self) { !!$self->{closing} }
 
 sub buffered_bytes ($self) {
-  my $len = length($self->{wbuf});
-  my $off = $self->{woff};
+  my $len = length($self->{wbuf} // '');
+  my $off = $self->{woff} // 0;
   return $len > $off ? ($len - $off) : 0;
 }
 
@@ -116,12 +103,29 @@ sub write ($self, $bytes) {
   return 0 if $self->{closed};
   return 1 if !defined($bytes) || $bytes eq '';
 
-  # Append to the write buffer. Use offset strategy to avoid copying on partial writes.
+  # Fast path: attempt to write immediately when there is no pending buffer.
+  # This reduces latency and avoids reliance on EPOLLOUT notifications to start a drain.
+  if ($self->buffered_bytes == 0) {
+    my $n = syswrite($self->{fh}, $bytes);
+    if (defined $n) {
+      return 1 if $n == length($bytes);
+      # partial: buffer remainder
+      substr($bytes, 0, $n, '');
+    } else {
+      my $errno = $! + 0;
+      # EAGAIN: buffer whole payload
+      if ($errno != 11) {
+        _fire_on_error($self, $errno);
+        _close_now($self);
+        return 0;
+      }
+    }
+  }
+
+  # Buffer what remains (or all, if immediate write did not happen).
   my $buf = $self->{wbuf};
   my $off = $self->{woff};
 
-  # If we've consumed a lot of the buffer, occasionally compact.
-  # This is intentionally infrequent to avoid O(n) churn.
   if ($off && ($off > 65_536 || $off > (length($buf) >> 1))) {
     substr($buf, 0, $off, '');
     $off = 0;
@@ -133,27 +137,25 @@ sub write ($self, $bytes) {
   $self->{woff} = $off;
 
   my $pending = length($buf) - $off;
-
   if (!$self->{write_blocked} && $pending > $self->{high_watermark}) {
     $self->{write_blocked} = 1;
   }
 
-  _enable_write($self);
-
+  $self->{watcher}->enable_write;
   return 1;
 }
 
 sub pause_read ($self) {
   return $self if $self->{closed} || $self->{read_paused};
   $self->{read_paused} = 1;
-  _disable_read($self);
+  $self->{watcher}->disable_read;
   return $self;
 }
 
 sub resume_read ($self) {
   return $self if $self->{closed} || !$self->{read_paused} || $self->{closing};
   $self->{read_paused} = 0;
-  _enable_read($self);
+  $self->{watcher}->enable_read;
   return $self;
 }
 
@@ -161,16 +163,12 @@ sub close_after_drain ($self) {
   return $self if $self->{closed};
   $self->{closing} = 1;
 
-  # Once closing is requested, stop delivering reads by default.
-  if (!$self->{read_paused}) {
-    $self->{read_paused} = 1;
-    _disable_read($self);
-  }
+  $self->pause_read;
 
   if ($self->buffered_bytes == 0) {
     _close_now($self);
   } else {
-    _enable_write($self); # ensure we drain
+    $self->{watcher}->enable_write;
   }
 
   return $self;
@@ -182,66 +180,26 @@ sub close ($self) {
   return $self;
 }
 
-# ---- internal helpers (kept shallow; hot paths are _on_*_ready) ----
+# ---- internals ----
 
 sub _set_nonblocking ($fh) {
   my $flags = fcntl($fh, F_GETFL, 0);
-  return if !defined $flags; # best-effort
+  return if !defined $flags;        # best-effort
   return if ($flags & O_NONBLOCK);
   fcntl($fh, F_SETFL, $flags | O_NONBLOCK);
   return;
 }
 
-sub _disable_read ($self) {
-  my $w = $self->{watcher} or return;
-  $w->disable_read if $w->can('disable_read');
-  return;
-}
-
-sub _enable_read ($self) {
-  my $w = $self->{watcher} or return;
-  $w->enable_read if $w->can('enable_read');
-  return;
-}
-
-sub _disable_write ($self) {
-  my $w = $self->{watcher} or return;
-  $w->disable_write if $w->can('disable_write');
-  return;
-}
-
-sub _enable_write ($self) {
-  my $w = $self->{watcher} or return;
-  $w->enable_write if $w->can('enable_write');
-  return;
-}
-
-sub _teardown_watcher ($self) {
-  my $w = delete $self->{watcher} or return;
-
-  $w->disable_read  if $w->can('disable_read');
-  $w->disable_write if $w->can('disable_write');
-
-  # Be conservative: different watcher implementations may expose different teardown names.
-  $w->close   if $w->can('close');
-  $w->cancel  if !$w->can('close')  && $w->can('cancel');
-  $w->destroy if !$w->can('close')  && !$w->can('cancel') && $w->can('destroy');
-
-  return;
-}
-
 sub _fire_on_error ($self, $errno) {
   my $cb = $self->{on_error} or return;
-  my $data = $self->{data};
-  $cb->($self, $errno, $data);
+  $cb->($self, $errno, $self->{data});
   return;
 }
 
 sub _fire_on_close ($self) {
   return if $self->{close_cb_fired}++;
   my $cb = $self->{on_close} or return;
-  my $data = $self->{data};
-  $cb->($self, $data);
+  $cb->($self, $self->{data});
   return;
 }
 
@@ -251,18 +209,19 @@ sub _close_now ($self) {
   $self->{closed}  = 1;
   $self->{closing} = 0;
 
-  _teardown_watcher($self);
+  if (my $w = $self->{watcher}) {
+    $w->cancel;
+  }
 
   if ($self->{close_fh}) {
-    my $fh = $self->{fh};
-    close($fh) if $fh;
+    CORE::close($self->{fh});
   }
 
   _fire_on_close($self);
   return;
 }
 
-sub _on_read_ready ($self, $w, $fh) {
+sub _on_read_ready ($self, $watcher, $fh) {
   return if $self->{closed} || $self->{read_paused} || $self->{closing};
 
   my $read_size = $self->{read_size};
@@ -276,7 +235,6 @@ sub _on_read_ready ($self, $w, $fh) {
 
     if (defined $n) {
       if ($n == 0) {
-        # EOF
         _close_now($self);
         return;
       }
@@ -284,24 +242,17 @@ sub _on_read_ready ($self, $w, $fh) {
       $total += $n;
 
       if (my $cb = $self->{on_read}) {
-        my $data = $self->{data};
-        $cb->($self, $bytes, $data);
+        $cb->($self, $bytes, $self->{data});
       }
 
       last if $self->{closed} || $self->{read_paused} || $self->{closing};
-
       last if $max_bytes && $total >= $max_bytes;
 
       next;
     }
 
-    # sysread error
     my $errno = $! + 0;
-
-    # EAGAIN / EWOULDBLOCK
-    if ($errno == 11 || $errno == 35 || $errno == 10035) {
-      return;
-    }
+    return if $errno == 11; # EAGAIN on Linux
 
     _fire_on_error($self, $errno);
     _close_now($self);
@@ -311,20 +262,18 @@ sub _on_read_ready ($self, $w, $fh) {
   return;
 }
 
-sub _on_write_ready ($self, $w, $fh) {
+sub _on_write_ready ($self, $watcher, $fh) {
   return if $self->{closed};
 
   my $buf = $self->{wbuf};
   my $off = $self->{woff};
 
-  my $len = length($buf);
-  my $pending = $len > $off ? ($len - $off) : 0;
+  my $pending = length($buf) - $off;
 
-  if ($pending == 0) {
-    _disable_write($self);
+  if ($pending <= 0) {
     $self->{wbuf} = '';
     $self->{woff} = 0;
-
+    $watcher->disable_write;
     _close_now($self) if $self->{closing};
     return;
   }
@@ -333,15 +282,13 @@ sub _on_write_ready ($self, $w, $fh) {
     my $n = syswrite($fh, $buf, $pending, $off);
 
     if (defined $n) {
-      if ($n == 0) {
-        # Treat as would-block-ish; just stop trying.
-        last;
-      }
-
-      $off += $n;
+      $off     += $n;
       $pending -= $n;
 
-      # Watermark transitions.
+      # FIX: persist partial progress so buffered_bytes() and watermark state
+      # can advance even when we return on EAGAIN later.
+      $self->{woff} = $off;
+
       if ($self->{write_blocked} && $pending < $self->{low_watermark}) {
         $self->{write_blocked} = 0;
       }
@@ -351,38 +298,30 @@ sub _on_write_ready ($self, $w, $fh) {
 
     my $errno = $! + 0;
 
-    # EAGAIN / EWOULDBLOCK
-    if ($errno == 11 || $errno == 35 || $errno == 10035) {
-      last;
-    }
+    # FIX: also persist offset before returning.
+    $self->{woff} = $off;
+
+    return if $errno == 11; # EAGAIN on Linux
 
     _fire_on_error($self, $errno);
     _close_now($self);
     return;
   }
 
-  # Commit updated buffer state.
-  $self->{woff} = $off;
-  if ($pending == 0) {
-    $self->{wbuf} = '';
-    $self->{woff} = 0;
-    _disable_write($self);
-    _close_now($self) if $self->{closing};
-  } else {
-    $self->{wbuf} = $buf;
-    _enable_write($self); # keep draining
-  }
+  # drained
+  $self->{wbuf} = '';
+  $self->{woff} = 0;
+  $watcher->disable_write;
 
+  _close_now($self) if $self->{closing};
   return;
 }
 
-sub _on_error_ready ($self, $w, $fh) {
+sub _on_error_ready ($self, $watcher, $fh) {
   return if $self->{closed};
 
-  # On many backends, "error" readiness corresponds to HUP/ERR; attempt to
-  # surface something useful via $! if available.
   my $errno = $! + 0;
-  $errno = 5 if !$errno; # EIO as a generic fallback
+  $errno = 5 if !$errno; # EIO fallback
 
   _fire_on_error($self, $errno);
   _close_now($self);
@@ -402,247 +341,228 @@ Linux::Event::Stream - Buffered, backpressure-aware I/O for nonblocking file des
   use v5.36;
   use Linux::Event;
   use Linux::Event::Stream;
-  use Socket qw(AF_UNIX SOCK_STREAM PF_UNSPEC);
 
   my $loop = Linux::Event->new;
 
-  socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, PF_UNSPEC) or die "socketpair: $!";
-
-  my $got = '';
-
-  my $sa = Linux::Event::Stream->new(
+  my $stream = Linux::Event::Stream->new(
     loop => $loop,
-    fh   => $a,
+    fh   => $fh,
 
-    on_read => sub ($s, $bytes, $data) {
-      $got .= $bytes;
-      $s->close if length($got) >= 5;
+    on_read  => sub ($stream, $bytes, $data) {
+      # Called whenever bytes are received.
+      # If you call $stream->close or $stream->close_after_drain here,
+      # further callbacks will not be invoked.
     },
 
-    on_error => sub ($s, $errno, $data) {
-      die "stream error: $errno";
+    on_error => sub ($stream, $errno, $data) {
+      # Called on fatal I/O error. Stream will close immediately after this.
     },
 
-    on_close => sub ($s, $data) {
-      # Fired exactly once when the stream is torn down.
+    on_close => sub ($stream, $data) {
+      # Called exactly once when the stream closes.
     },
+
+    high_watermark => 1_048_576,  # bytes
+    low_watermark  =>   262_144,  # bytes
+
+    read_size         => 8192,
+    max_read_per_tick => 0,
+
+    data => $user_data,
   );
 
-  $sa->write("hello");
-
-  # Drain from the other end (just as an example; real code would also use Stream)
-  $loop->watch($b, read => sub ($w, $fh, $data) { sysread($fh, my $x, 4096) });
-
+  $stream->write("hello\n");
   $loop->run;
 
 =head1 DESCRIPTION
 
-B<Linux::Event::Stream> provides buffered, backpressure-aware I/O semantics for any
-nonblocking file descriptor used with L<Linux::Event>.
+B<Linux::Event::Stream> provides buffered, backpressure-aware I/O on top of
+L<Linux::Event> watchers.
 
-It is intentionally small and focused:
+It wraps a nonblocking file descriptor and adds:
 
 =over 4
 
 =item *
 
-No socket setup (listen/connect/accept)
+Write buffering
 
 =item *
 
-No fork logic
+High/low watermark backpressure tracking (hysteresis latch)
 
 =item *
 
-No protocol logic (HTTP/Redis/etc.)
+Graceful close-after-drain support
 
 =item *
 
-No TLS
-
-=item *
-
-No modifications to the event loop
+Optional read throttling
 
 =back
 
-A Stream is just:
-
-  fd + loop + internal watcher + buffering + callbacks
+Stream does not create sockets, perform protocol parsing, or modify the event
+loop. It is a small policy layer over a file descriptor.
 
 =head1 CONSTRUCTOR
 
-=head2 new
+=head2 new(%args)
 
-  my $stream = Linux::Event::Stream->new(%opt);
-
-Required:
+Required arguments:
 
 =over 4
 
-=item * C<loop>
+=item loop
 
 A L<Linux::Event> loop instance.
 
-=item * C<fh>
+=item fh
 
-A nonblocking filehandle (or any filehandle that can be made nonblocking).
-
-=back
-
-Callbacks (all optional):
-
-=over 4
-
-=item * C<on_read =E<gt> sub ($stream, $bytes, $data) { ... }>
-
-Called with raw bytes read from the file descriptor.
-
-=item * C<on_error =E<gt> sub ($stream, $errno, $data) { ... }>
-
-Called when a read/write/error condition occurs. C<$errno> is numeric (C<$!+0>)
-at the time of failure. After C<on_error>, Stream closes by default.
-
-=item * C<on_close =E<gt> sub ($stream, $data) { ... }>
-
-Called exactly once when the stream is closed and fully torn down.
+A filehandle or socket. It will be placed into nonblocking mode.
 
 =back
 
-Buffering / backpressure:
+Optional arguments:
 
 =over 4
 
-=item * C<high_watermark>
+=item on_read => sub ($stream, $bytes, $data)
 
-Default: 1_048_576 bytes.
+Called whenever bytes are read.
 
-If buffered write data exceeds this amount, C<is_write_blocked> becomes true.
-Stream does not automatically stop accepting writes; it reports state so the
-caller can apply backpressure.
+This callback may call C<close> or C<close_after_drain>.
 
-=item * C<low_watermark>
+=item on_error => sub ($stream, $errno, $data)
 
-Default: 262_144 bytes.
+Called when a fatal I/O error occurs.
 
-When buffered bytes drop below this amount, C<is_write_blocked> becomes false.
+After firing C<on_error>, the stream closes immediately (buffer is discarded)
+and then C<on_close> fires.
 
-=back
+=item on_close => sub ($stream, $data)
 
-Read tuning:
+Called exactly once when the stream closes (for any reason).
 
-=over 4
+=item high_watermark
 
-=item * C<read_size>
+Defaults to 1MB.
 
-Default: 8192 bytes per C<sysread>.
+If pending buffered bytes exceed this value, C<is_write_blocked> becomes true.
 
-=item * C<max_read_per_tick>
+=item low_watermark
 
-Default: 0 (unlimited). If non-zero, caps the total bytes read per readiness
-notification to improve fairness across many active streams.
+Defaults to 256KB.
 
-=back
+When pending buffered bytes drop below this value, C<is_write_blocked> becomes
+false.
 
-Ownership:
+If low_watermark is greater than high_watermark, it is clamped to high_watermark.
 
-=over 4
+=item read_size
 
-=item * C<close_fh>
+Maximum bytes per sysread() call (default 8192).
 
-Default: false. If true, Stream will C<close()> the filehandle when the stream
-closes. If false, Stream tears down its watcher but does not close the fd.
+=item max_read_per_tick
 
-=item * C<data>
+Limit total bytes read per loop tick. 0 means unlimited.
+
+=item data
 
 Opaque user data passed to callbacks.
+
+=item close_fh
+
+If true, the underlying filehandle is closed when the stream closes.
+
+By default Stream does not assume ownership of the filehandle.
 
 =back
 
 =head1 METHODS
 
-=head2 write
+=head2 write($bytes)
 
-  $stream->write($bytes);  # returns bool
+Queues bytes for sending and returns true if the bytes were accepted for
+buffering.
 
-Buffers bytes for writing and arms write readiness notifications as needed.
+If there is no pending buffered data, Stream attempts an immediate syswrite()
+before buffering the remainder.
 
-Returns false only if the stream is already closed.
-
-=head2 pause_read / resume_read
-
-  $stream->pause_read;
-  $stream->resume_read;
-
-Disables or re-enables read delivery. While paused, read readiness is not
-processed and C<on_read> is not called.
-
-=head2 close
-
-  $stream->close;
-
-Immediately closes the stream (idempotent) and tears down watchers.
-If C<close_fh> is enabled, also closes the filehandle.
-
-=head2 close_after_drain
-
-  $stream->close_after_drain;
-
-Requests a graceful shutdown: stop reads and flush all buffered writes; when the
-write buffer drains, the stream closes. Idempotent.
-
-=head2 is_closed / is_closing
-
-Boolean state queries.
-
-=head2 is_write_blocked
-
-True when buffered bytes exceed C<high_watermark>. Clears when buffered bytes
-drop below C<low_watermark>.
+A true return value does not imply that the peer has received the bytes; delivery
+is asynchronous.
 
 =head2 buffered_bytes
 
-Returns the current number of bytes queued in the write buffer.
+Returns the number of bytes currently buffered and not yet written to the file
+descriptor.
 
-=head2 fh
+=head2 is_write_blocked
 
-Returns the underlying filehandle.
+Returns true if Stream is in a backpressured state due to the configured
+watermarks.
 
-=head1 CALLBACK SEMANTICS
+This is a hysteresis latch: it becomes true above C<high_watermark> and becomes
+false below C<low_watermark>.
 
-=head2 on_read
+=head2 pause_read
 
-Called with raw bytes as they are read. If the peer closes cleanly (EOF),
-Stream closes and C<on_close> is called.
+Disables read notifications.
 
-=head2 on_error
+=head2 resume_read
 
-Called when a read/write operation fails. By default Stream then closes and
-calls C<on_close> (exactly once).
+Re-enables read notifications (unless the stream is closing).
 
-=head2 on_close
+=head2 close
 
-Called exactly once when teardown is complete.
+Immediately closes the stream.
 
-=head1 DESIGN NOTES
+Buffered data is discarded.
 
-Stream registers exactly one watcher with the loop and arms/disarms write
-notifications automatically to prevent write-spin.
+=head2 close_after_drain
 
-Stream is designed as a universal buffered I/O layer across the ecosystem:
+Stops reading and closes once all buffered data has been written.
 
-  Loop   = engine
-  Listen = socket acquisition
-  Fork   = process lifecycle
-  Stream = I/O semantics
+=head2 is_closed
+
+Returns true once closed.
+
+=head2 is_closing
+
+Returns true if C<close_after_drain> has been requested.
+
+=head1 BACKPRESSURE SEMANTICS
+
+Watermarks operate on pending buffered bytes (C<buffered_bytes>).
+
+C<is_write_blocked> transitions:
+
+=over 4
+
+=item *
+
+false → true when buffered_bytes > high_watermark
+
+=item *
+
+true → false when buffered_bytes < low_watermark
+
+=back
+
+The transition back to false occurs inside the WRITE-ready drain path, not
+necessarily during a READ event on the peer.
+
+=head1 INTEGRATION NOTES
+
+Stream is intended to be composed by higher-level modules (for example a future
+C<Linux::Event::Listen> connection wrapper) to provide consistent buffered I/O
+and backpressure behavior.
 
 =head1 AUTHOR
 
-Joshua S. Day E<lt>hax@cpan.orgE<gt>
+Joshua S. Day
 
 =head1 LICENSE
 
-This library is free software; you can redistribute it and/or modify it under
-the same terms as Perl itself.
+Same terms as Perl itself.
 
 =cut

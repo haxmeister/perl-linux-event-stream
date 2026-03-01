@@ -14,25 +14,13 @@ my $loop = Linux::Event->new;
 my $sa = Linux::Event::Stream->new(
   loop => $loop,
   fh   => $a,
-  on_read => sub ($s, $bytes, $data) {
-    print "A got: $bytes";
-  },
-  on_error => sub ($s, $errno, $data) {
-    warn "A error: $errno\n";
-  },
-  on_close => sub ($s, $data) {
-    print "A closed\n";
-  },
+  on_read => sub ($s, $bytes, $data) { print "A got: $bytes" },
 );
 
 my $sb = Linux::Event::Stream->new(
   loop => $loop,
   fh   => $b,
-  on_read => sub ($s, $bytes, $data) {
-    print "B got: $bytes";
-    # echo back
-    $s->write($bytes);
-  },
+  on_read => sub ($s, $bytes, $data) { $s->write($bytes) }, # echo
 );
 
 $sa->write("hello from A\n");

@@ -10,22 +10,10 @@ WriteMakefile(
   LICENSE      => 'perl',
   MIN_PERL_VERSION => '5.036000',
   PREREQ_PM => {
-    'Linux::Event' => 0,
+    'Linux::Event' => 0.007,
   },
   TEST_REQUIRES => {
-    'Test2::V0' => 0,
-    'Socket'   => 0,
-  },
-  META_MERGE => {
-    resources => {
-      repository => {
-        type => 'git',
-        url  => 'https://github.com/haxmeister/Linux-Event-Stream.git',
-        web  => 'https://github.com/haxmeister/Linux-Event-Stream',
-      },
-      bugtracker => {
-        web => 'https://github.com/haxmeister/Linux-Event-Stream/issues',
-      },
-    },
+    'Test::More' => 0,
+    'Socket'     => 0,
   },
 );
