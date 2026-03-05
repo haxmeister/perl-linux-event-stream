@@ -439,322 +439,325 @@ Linux::Event::Stream - Buffered, backpressure-aware I/O for nonblocking file des
 
   my $loop = Linux::Event->new;
 
-  # Raw bytes mode (TCP/pipes): on_read receives arbitrary chunks.
+  # Raw bytes mode: on_read receives arbitrary chunks.
   my $stream = Linux::Event::Stream->new(
     loop => $loop,
     fh   => $fh,
 
-    on_read  => sub ($stream, $bytes, $data) {
-      # Called whenever bytes are received.
-      # If you call $stream->close or $stream->close_after_drain here,
-      # further callbacks will not be invoked.
+    on_read => sub ($stream, $bytes, $data) {
+      # ...
     },
 
     on_error => sub ($stream, $errno, $data) {
-      # Called on fatal I/O error. Stream will close immediately after this.
+      # fatal I/O error; stream will close
+      # local $! = $errno;
     },
 
     on_close => sub ($stream, $data) {
-      # Called exactly once when the stream closes.
+      # closed (EOF, error, or explicit close)
     },
 
-    high_watermark => 1_048_576,  # bytes
-    low_watermark  =>   262_144,  # bytes
-
-    read_size         => 8192,
-    max_read_per_tick => 0,
-
-    data => $user_data,
+    data => { ... },
   );
 
-  $stream->write("hello\n");
   $loop->run;
 
-  # Framed/message mode: on_message receives complete messages.
-  my $framed = Linux::Event::Stream->new(
-    loop       => $loop,
-    fh         => $fh,
+=head2 Message mode (codec)
+
+  my $stream = Linux::Event::Stream->new(
+    loop => $loop,
+    fh   => $fh,
+
     codec      => 'line',
-    on_message => sub ($stream, $line, $data) {
-      # Called for each complete line ("\n" removed by the default line codec).
-      $stream->write_message("echo: $line");
+    on_message => sub ($stream, $msg, $data) {
+      $stream->write_message("echo: $msg");
+      $stream->close_after_drain if $msg eq 'quit';
     },
+
+    on_error => sub ($stream, $errno, $data) { },
+    on_close => sub ($stream, $data) { },
   );
 
 =head1 DESCRIPTION
 
-B<Linux::Event::Stream> provides buffered, backpressure-aware I/O on top of
-L<Linux::Event> watchers.
-
-It wraps a nonblocking file descriptor and adds:
+B<Linux::Event::Stream> owns an established nonblocking filehandle (typically a
+socket) and provides:
 
 =over 4
 
-=item *
+=item * Buffered writes
 
-Write buffering
+Writes are queued and flushed when the fd becomes writable.
 
-=item *
+=item * Raw reads (bytes mode)
 
-High/low watermark backpressure tracking (hysteresis latch)
+In bytes mode, inbound data is delivered as arbitrary chunks via C<on_read>.
 
-=item *
+=item * Optional framing (message mode)
 
-Graceful close-after-drain support
+In message mode, inbound bytes are decoded by a codec and delivered via
+C<on_message>.
 
-=item *
+=item * Backpressure signaling
 
-Optional read throttling
+Stream tracks queued outbound bytes and reports when the stream is write blocked
+(above the high watermark). This lets upstream code pause reads to keep memory
+bounded.
 
 =back
 
-Stream does not create sockets or modify the event loop. It is a small policy
-layer over a file descriptor.
+Stream does not bind, accept, connect, or resolve addresses. It only manages I/O
+for a filehandle you provide.
 
-In raw mode, Stream delivers arbitrary byte chunks via C<on_read>.
+=head1 LAYERING
 
-In framed/message mode, Stream buffers incoming bytes internally and uses a
-codec to emit complete messages via C<on_message>.
+This distribution is part of a composable socket stack:
+
+=over 4
+
+=item * B<Linux::Event::Listen>
+
+Server-side socket acquisition: bind + listen + accept. Produces accepted
+nonblocking filehandles.
+
+=item * B<Linux::Event::Connect>
+
+Client-side socket acquisition: nonblocking outbound connect. Produces connected
+nonblocking filehandles.
+
+=item * B<Linux::Event::Stream>
+
+Buffered I/O + backpressure for an established filehandle (accepted or
+connected). Stream owns the filehandle and handles read/write buffering.
+
+=back
+
+Canonical composition:
+
+  Listen/Connect -> Stream -> (your protocol/codec/state)
 
 =head1 CONSTRUCTOR
 
-=head2 new(%args)
+=head2 new
 
-Required arguments:
+  my $stream = Linux::Event::Stream->new(%opt);
 
-=over 4
+Creates and starts a stream immediately. Unknown keys are fatal.
 
-=item loop
-
-A L<Linux::Event> loop instance.
-
-=item fh
-
-A filehandle or socket. It will be placed into nonblocking mode.
-
-=back
-
-Optional arguments:
+Required:
 
 =over 4
 
+=item * C<loop>
 
-=item on_read => sub ($stream, $bytes, $data)
+A L<Linux::Event::Loop> instance.
 
-Raw bytes mode.
+=item * C<fh>
 
-Called whenever bytes are read.
-
-This callback may call C<close> or C<close_after_drain>.
-
-=item codec
-
-Framed/message mode.
-
-Required when using C<on_message>.
-
-May be either a codec object (a hashref with C<decode> and C<encode> coderefs),
-or one of the builtin aliases:
-
-=over 4
-
-=item *
-
-C<line> - newline-delimited messages
-
-=item *
-
-C<netstring> - C<< <len>:<payload>, >>
-
-=item *
-
-C<u32be> - 32-bit big-endian length prefix
+A filehandle. Stream forces nonblocking mode.
 
 =back
 
-=item on_message => sub ($stream, $msg, $data)
+Choose one input delivery mode:
 
-Framed/message mode.
+=head3 Raw bytes mode
 
-Enables internal read buffering and emits complete messages produced by the
-codec.
+Provide C<on_read>:
 
-When C<on_message> is provided, C<on_read> is not used.
+  on_read => sub ($stream, $bytes, $data) { ... }
 
-=item max_inbuf
+=head3 Message mode
 
-Framed/message mode.
+Provide C<on_message>. You may also provide a codec (recommended):
 
-Maximum buffered undecoded bytes (default 1MB). If exceeded, Stream fires
-C<on_error> with errno 0, sets C<last_error>, and closes.
+  on_message => sub ($stream, $msg, $data) { ... }
+  codec      => 'line' | $codec_object
 
-=item on_error => sub ($stream, $errno, $data)
+If you do not provide a codec, you may provide C<decoder> and C<encoder>
+coderefs (see L</CODECS>).
 
-Called when a fatal I/O error occurs.
+=head1 OPTIONS
 
-After firing C<on_error>, the stream closes immediately (buffer is discarded)
-and then C<on_close> fires.
+=head2 data
 
-=item on_close => sub ($stream, $data)
+  data => $any
 
-Called exactly once when the stream closes (for any reason).
+Opaque user data passed to callbacks as the last argument.
 
-=item high_watermark
+=head2 on_read
 
-Defaults to 1MB.
+  on_read => sub ($stream, $bytes, $data) { ... }
 
-If pending buffered bytes exceed this value, C<is_write_blocked> becomes true.
+Raw bytes mode callback.
 
-=item low_watermark
+=head2 on_message
 
-Defaults to 256KB.
+  on_message => sub ($stream, $msg, $data) { ... }
 
-When pending buffered bytes drop below this value, C<is_write_blocked> becomes
-false.
+Message mode callback.
 
-If low_watermark is greater than high_watermark, it is clamped to high_watermark.
+=head2 on_error
 
-=item read_size
+  on_error => sub ($stream, $errno, $data) { ... }
 
-Maximum bytes per sysread() call (default 8192).
+Called on fatal I/O error with numeric errno. Stream will close and then invoke
+C<on_close>.
 
-=item max_read_per_tick
+=head2 on_close
 
-Limit total bytes read per loop tick. 0 means unlimited.
+  on_close => sub ($stream, $data) { ... }
 
-=item data
+Called once when the stream closes (EOF, error, or explicit close). After this
+fires, the stream is inert.
 
-Opaque user data passed to callbacks.
+=head2 read_size
 
-=item close_fh
+  read_size => 8192  # default
 
-If true, the underlying filehandle is closed when the stream closes.
+Read chunk size used internally for sysread.
 
-By default Stream does not assume ownership of the filehandle.
+=head2 max_read_per_tick
 
-=back
+  max_read_per_tick => 0  # default (unlimited)
+
+If non-zero, caps how many read iterations are performed per readiness event.
+
+=head2 max_inbuf
+
+  max_inbuf => 1048576  # default
+
+Maximum buffered inbound bytes in message mode. If exceeded, the stream fails
+with an error to prevent unbounded memory use.
+
+=head2 high_watermark / low_watermark
+
+  high_watermark => 1048576,  # default
+  low_watermark  => 262144,   # default (clamped <= high)
+
+Write backpressure thresholds. When queued outbound bytes exceed the high
+watermark, the stream becomes write blocked. It becomes unblocked again once
+queued bytes drop to (or below) the low watermark.
+
+=head2 close_fh
+
+  close_fh => 1  # default
+
+If true, Stream closes the underlying filehandle when it closes. If false,
+Stream detaches from the fh and you remain responsible for closing it.
+
+=head1 CODECS
+
+=head2 codec
+
+  codec => 'line'
+
+Provides a built-in codec by name. (See your distribution for which codecs are
+included.)
+
+=head2 decoder / encoder
+
+  decoder => sub ($bytes, $state) { ... }
+  encoder => sub ($msg,   $state) { ... }
+
+Advanced: provide explicit decoder/encoder coderefs.
+
+Do not mix C<codec> with C<decoder>/C<encoder>.
+
+=head1 CALLBACK CONTRACT
+
+All callbacks share the same shape:
+
+  ($stream, ...args..., $data)
+
+Where C<$data> is the C<data> option (or undef).
 
 =head1 METHODS
 
-=head2 write($bytes)
+=head2 fh
 
-Queues bytes for sending and returns true if the bytes were accepted for
-buffering.
+  my $fh = $stream->fh;
 
-If there is no pending buffered data, Stream attempts an immediate syswrite()
-before buffering the remainder.
+Return the underlying filehandle.
 
-A true return value does not imply that the peer has received the bytes; delivery
-is asynchronous.
+=head2 is_closed / is_closing
+
+  $stream->is_closed;
+  $stream->is_closing;
+
+Introspection for stream state.
 
 =head2 buffered_bytes
 
-Returns the number of bytes currently buffered and not yet written to the file
-descriptor.
+  my $n = $stream->buffered_bytes;
+
+Number of queued outbound bytes not yet written.
 
 =head2 is_write_blocked
 
-Returns true if Stream is in a backpressured state due to the configured
-watermarks.
+  if ($stream->is_write_blocked) { ... }
 
-This is a hysteresis latch: it becomes true above C<high_watermark> and becomes
-false below C<low_watermark>.
-
-=head2 pause_read
-
-Disables read notifications.
-
-=head2 resume_read
-
-Re-enables read notifications (unless the stream is closing).
-
-=head2 close
-
-Immediately closes the stream.
-
-Buffered data is discarded.
-
-=head2 close_after_drain
-
-Stops reading and closes once all buffered data has been written.
-
-=head2 is_closed
-
-Returns true once closed.
-
-=head2 is_closing
-
-Returns true if C<close_after_drain> has been requested (the stream is closing
-but may still have buffered bytes to write).
-
-=head2 write_message($msg)
-
-Framed/message mode.
-
-Encodes C<$msg> using the configured codec and then writes the resulting bytes.
-
-Returns true if the encoded bytes were accepted for buffering.
+True when queued outbound bytes exceed the high watermark.
 
 =head2 last_error
 
-Returns the last non-EOF error recorded by the stream.
+  my $errno = $stream->last_error;
 
-For I/O errors, C<on_error> receives a non-zero errno.
+Return the last error number observed (if any).
 
-For codec/buffer errors in framed mode, C<on_error> receives errno 0 and
-C<last_error> contains a string like C<codec:...>.
+=head2 write
 
-=head1 CODEC CONTRACT
+  $stream->write($bytes);
 
-In framed/message mode, Stream expects a codec object that is a hashref (or a
-blessed hashref) with two coderefs:
+Queue raw bytes for writing.
+
+Stream attempts an immediate write fast-path when there is no pending outbound
+buffer, then falls back to buffering and enabling write readiness.
+
+=head2 write_message
+
+  $stream->write_message($msg);
+
+Encode a message using the configured codec/encoder and queue it for writing.
+Only valid in message mode.
+
+=head2 pause_read / resume_read
+
+  $stream->pause_read;
+  $stream->resume_read;
+
+Disable/enable reading from the underlying fd. Use this with backpressure (for
+example, pause reads when your downstream is write blocked).
+
+=head2 close_after_drain
+
+  $stream->close_after_drain;
+
+Request a graceful close: stop accepting new writes, flush pending outbound data,
+then close.
+
+=head2 close
+
+  $stream->close;
+
+Close immediately.
+
+=head1 BACKPRESSURE PATTERN
+
+A canonical pattern is:
 
 =over 4
 
-=item *
+=item * if downstream is write blocked, pause upstream reads
 
-C<< $codec->{decode}->($codec, \$inbuf, \@out) >>
-
-Consumes from C<$$inbuf> (in place) and pushes zero or more decoded messages
-onto C<@out>. Returns true on success, or C<(0, $err)> on failure.
-
-=item *
-
-C<< $codec->{encode}->($codec, $msg) >>
-
-Returns a byte string to write for the given message.
+=item * when downstream drains, resume upstream reads
 
 =back
 
-Stream validates the codec once at construction time and calls these coderefs
-directly on the hot path to avoid per-message method dispatch overhead.
+This keeps buffering bounded and makes backpressure explicit in user code.
 
-=head1 BACKPRESSURE SEMANTICS
+=head1 SEE ALSO
 
-Watermarks operate on pending buffered bytes (C<buffered_bytes>).
-
-C<is_write_blocked> transitions:
-
-=over 4
-
-=item *
-
-false -> true when buffered_bytes > high_watermark
-
-=item *
-
-true -> false when buffered_bytes < low_watermark
-
-=back
-
-The transition back to false occurs inside the WRITE-ready drain path, not
-necessarily during a READ event on the peer.
-
-=head1 INTEGRATION NOTES
-
-Stream is intended to be composed by higher-level modules (for example a future
-C<Linux::Event::Listen> connection wrapper) to provide consistent buffered I/O
-and backpressure behavior.
+L<Linux::Event>, L<Linux::Event::Listen>, L<Linux::Event::Connect>
 
 =head1 AUTHOR
 
